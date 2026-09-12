@@ -1,7 +1,8 @@
 import streamlit as st
 from pathlib import Path
 from datetime import date
-from core.rag import LocalRAG
+#from core.rag import LocalRAG
+from core.rag import search, format_context, ensure_index, collection_count, dataset_count
 from core.model_router import ModelRouter
 from core.agents import LegalSupervisor, detect_intent
 from core.i18n import UI
@@ -578,8 +579,14 @@ def build_css(theme: str) -> str:
 # CORE BUILDS (cached)
 # ============================================================
 @st.cache_resource
-def build_rag():
-    return LocalRAG(str(BASE / "data" / "demo_knowledge.jsonl"))
+def build_rag_index():
+    """Initialize the Chroma RAG index once per Streamlit process."""
+    try:
+        ensure_index()
+        return True
+    except Exception as exc:
+        st.error(f"RAG initialization failed: {exc}")
+        return False
 
 
 def blueprint(intent):
@@ -654,11 +661,16 @@ def show_plan(intent, complete=False):
 # ============================================================
 # BUILD CORE SERVICES
 # ============================================================
-rag = build_rag()
+rag_ready = build_rag_index()
 db = Database(str(BASE / "data" / "asaan_qanoon.db"))
 db.export_dashboard_data(BASE / "static" / "Dashboard" / "dashboard-db.js")
-router = ModelRouter(st.secrets)
-supervisor = LegalSupervisor(rag, router)
+
+@st.cache_resource
+def build_router():
+    return ModelRouter(st.secrets)
+
+router = build_router()
+supervisor = LegalSupervisor(router=router)
 
 
 # ============================================================
@@ -668,7 +680,7 @@ with st.sidebar:
     # --- LOGO ---
     logo_path = BASE / "static" / "assets" / "logo" / "logo 2.jpeg"
     if logo_path.exists():
-        st.image(str(logo_path), use_container_width=True)
+        st.image(str(logo_path), width="stretch")
     else:
         st.warning(f"Logo not found at: {logo_path}")
 
@@ -910,15 +922,47 @@ elif page == "Knowledge Sources":
     st.markdown(f'<div class="kicker">{t("sources_kicker")}</div>', unsafe_allow_html=True)
     st.title(t("sources_title"))
     st.warning(t("sources_warn"))
-    for item in rag.docs:
-        meta = item.get("metadata", {})
-        title = meta.get("source_title", "Source")
-        url = meta.get("source_url", "")
-        link_html = f'<a href="{url}">{t("visit_source")}</a>' if url else ""
-        st.markdown(
-            f'<div class="source"><b>{title}</b><br>{item["text"]}<br>{link_html}</div>',
-            unsafe_allow_html=True,
+    try:
+        total_dataset = dataset_count()
+        total_indexed = collection_count()
+        st.caption(f"Dataset records: {total_dataset} | Indexed RAG chunks: {total_indexed}")
+
+        preview = search(
+            query="Pakistan legal civic information",
+            top_k=20,
         )
+        source_items = preview.get("results", [])
+
+        if not source_items:
+            st.info("No indexed knowledge sources are currently available.")
+        else:
+            seen = set()
+            for item in source_items:
+                title = item.get("title", "Source")
+                url = item.get("source_url", "")
+                authority = item.get("authority", "")
+                jurisdiction = item.get("jurisdiction", "")
+                category = item.get("category", "")
+                verified = item.get("verified", False)
+                key = (title, url)
+
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                st.markdown(f"**{title}**")
+                details = " | ".join(
+                    x for x in [authority, jurisdiction, category] if x
+                )
+                if details:
+                    st.caption(details)
+                st.caption("Verified source" if verified else "Verification status not confirmed")
+                if url:
+                    st.link_button(t("visit_source"), url, width="content")
+                st.divider()
+
+    except Exception as exc:
+        st.error(f"Unable to load knowledge sources: {exc}")
     st.markdown(f'#### {t("source_standards")}')
     st.markdown(t("source_standards_body"))
 
@@ -940,7 +984,16 @@ else:  # Settings
             st.rerun()
     st.divider()
     st.subheader(t("system_status"))
-    status = router.status()
-    for provider, details in status.items():
-        state = t("available") if details["healthy"] else f'{t("cooling")} ({details["cooldown_seconds"]} {t("seconds")})'
-        st.write(f"**{provider.title()}**: {state}")
+    if hasattr(router, "status"):
+        status = router.status()
+        for provider, details in status.items():
+            healthy = details.get("healthy", True)
+            cooldown = details.get("cooldown_seconds", 0)
+            state = (
+                t("available")
+                if healthy
+                else f'{t("cooling")} ({cooldown} {t("seconds")})'
+            )
+            st.write(f"**{provider.title()}**: {state}")
+    else:
+        st.info("Provider status reporting is not available in the current model router.")
