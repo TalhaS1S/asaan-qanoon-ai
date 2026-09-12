@@ -1,90 +1,237 @@
-from __future__ import annotations
-import time, requests
-from dataclasses import dataclass
-from typing import Dict
+import time
+import requests
+import streamlit as st
 
-@dataclass
+
 class ProviderHealth:
-    failures: int = 0
-    cooldown_until: float = 0.0
-    last_error: str = ""
+    def __init__(self):
+        self.failures = {}
+        self.cooldowns = {}
+
+    def is_available(self, provider):
+        until = self.cooldowns.get(provider, 0)
+        return time.time() >= until
+
+    def mark_success(self, provider):
+        self.failures[provider] = 0
+        self.cooldowns[provider] = 0
+
+    def mark_failure(self, provider):
+        count = self.failures.get(provider, 0) + 1
+        self.failures[provider] = count
+
+        if count >= 2:
+            self.cooldowns[provider] = time.time() + 120
+
+
+@st.cache_resource
+def get_provider_health():
+    return ProviderHealth()
+
 
 class ModelRouter:
-    """Fault-tolerant router for free/low-cost model providers."""
     def __init__(self, secrets):
         self.secrets = secrets
-        self.health: Dict[str, ProviderHealth] = {
-            "openrouter": ProviderHealth(),
-            "groq": ProviderHealth(),
-            "gemini": ProviderHealth(),
-        }
+        self.health = get_provider_health()
 
-    def _available(self, provider):
-        return time.time() >= self.health[provider].cooldown_until
-
-    def _fail(self, provider, err):
-        h = self.health[provider]
-        h.failures += 1
-        h.last_error = str(err)[:300]
-        if h.failures >= 2:
-            h.cooldown_until = time.time() + 120
-
-    def _success(self, provider):
-        self.health[provider] = ProviderHealth()
+    def _get_secret(self, key, default=""):
+        try:
+            return self.secrets.get(key, default)
+        except Exception:
+            return default
 
     def _openrouter(self, messages):
-        key = self.secrets.get("OPENROUTER_API_KEY", "")
-        model = self.secrets.get("OPENROUTER_MODEL", "openrouter/free")
-        if not key: raise RuntimeError("OPENROUTER_API_KEY not configured")
-        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type":"application/json"},
-            json={"model":model,"messages":messages,"temperature":0.15}, timeout=35)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"], model
+        api_key = self._get_secret("OPENROUTER_API_KEY")
+        model = self._get_secret("OPENROUTER_MODEL", "openrouter/free")
+
+        if not api_key:
+            raise RuntimeError("OpenRouter API key is missing.")
+
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+            },
+            timeout=45,
+        )
+
+        if response.status_code == 429:
+            raise RuntimeError("OpenRouter rate limit reached.")
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if "choices" not in data or not data["choices"]:
+            raise RuntimeError("OpenRouter returned no choices.")
+
+        content = data["choices"][0]["message"].get("content", "")
+
+        if not content:
+            raise RuntimeError("OpenRouter returned an empty response.")
+
+        return {
+            "text": content,
+            "provider": "openrouter",
+            "model": model,
+        }
 
     def _groq(self, messages):
-        key = self.secrets.get("GROQ_API_KEY", "")
-        model = self.secrets.get("GROQ_MODEL", "")
-        if not key or not model: raise RuntimeError("GROQ credentials/model not configured")
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type":"application/json"},
-            json={"model":model,"messages":messages,"temperature":0.15}, timeout=35)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"], model
+        api_key = self._get_secret("GROQ_API_KEY")
+        model = self._get_secret("GROQ_MODEL")
+
+        if not api_key:
+            raise RuntimeError("Groq API key is missing.")
+
+        if not model:
+            raise RuntimeError("Groq model is missing.")
+
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": messages,
+            },
+            timeout=45,
+        )
+
+        if response.status_code == 429:
+            raise RuntimeError("Groq rate limit reached.")
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if "choices" not in data or not data["choices"]:
+            raise RuntimeError("Groq returned no choices.")
+
+        content = data["choices"][0]["message"].get("content", "")
+
+        if not content:
+            raise RuntimeError("Groq returned an empty response.")
+
+        return {
+            "text": content,
+            "provider": "groq",
+            "model": model,
+        }
 
     def _gemini(self, messages):
-        key = self.secrets.get("GEMINI_API_KEY", "")
-        model = self.secrets.get("GEMINI_MODEL", "")
-        if not key or not model: raise RuntimeError("Gemini credentials/model not configured")
-        prompt = "\n\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        r = requests.post(url, headers={"Content-Type":"application/json"},
-            json={"contents":[{"parts":[{"text":prompt}]}],
-                  "generationConfig":{"temperature":0.15}}, timeout=35)
-        r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"], model
+        api_key = self._get_secret("GEMINI_API_KEY")
+        model = self._get_secret("GEMINI_MODEL")
 
-    def generate(self, messages, preferred_order=None):
-        order = preferred_order or ["openrouter","groq","gemini"]
-        errors=[]
-        for provider in order:
-            if not self._available(provider):
+        if not api_key:
+            raise RuntimeError("Gemini API key is missing.")
+
+        if not model:
+            raise RuntimeError("Gemini model is missing.")
+
+        prompt = "\n\n".join(
+            f"{msg.get('role', 'user').upper()}: {msg.get('content', '')}"
+            for msg in messages
+        )
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+            },
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ]
+            },
+            timeout=45,
+        )
+
+        if response.status_code == 429:
+            raise RuntimeError("Gemini rate limit reached.")
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        candidates = data.get("candidates", [])
+
+        if not candidates:
+            raise RuntimeError("Gemini returned no candidates.")
+
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+
+        if not parts:
+            raise RuntimeError("Gemini returned no content.")
+
+        content = parts[0].get("text", "")
+
+        if not content:
+            raise RuntimeError("Gemini returned an empty response.")
+
+        return {
+            "text": content,
+            "provider": "gemini",
+            "model": model,
+        }
+
+    def generate(self, messages):
+        providers = [
+            ("openrouter", self._openrouter),
+            ("groq", self._groq),
+            ("gemini", self._gemini),
+        ]
+
+        errors = []
+
+        for provider_name, provider_fn in providers:
+
+            if not self.health.is_available(provider_name):
+                errors.append(
+                    f"{provider_name}: temporarily in cooldown"
+                )
                 continue
-            try:
-                fn = getattr(self, f"_{provider}")
-                text, model = fn(messages)
-                self._success(provider)
-                return {"ok":True,"text":text,"provider":provider,"model":model,"errors":errors}
-            except Exception as e:
-                self._fail(provider,e)
-                errors.append(f"{provider}: {type(e).__name__}: {str(e)[:150]}")
-        return {"ok":False,"text":"","provider":None,"model":None,"errors":errors}
 
-    def status(self):
-        now=time.time()
-        return {p:{
-            "healthy": now >= h.cooldown_until,
-            "failures": h.failures,
-            "cooldown_seconds": max(0,int(h.cooldown_until-now)),
-            "last_error": h.last_error
-        } for p,h in self.health.items()}
+            try:
+                result = provider_fn(messages)
+
+                self.health.mark_success(provider_name)
+
+                result["errors"] = errors
+
+                return result
+
+            except Exception as e:
+                self.health.mark_failure(provider_name)
+
+                errors.append(
+                    f"{provider_name}: {str(e)}"
+                )
+
+        return {
+            "text": "",
+            "provider": "none",
+            "model": "none",
+            "errors": errors,
+        }
